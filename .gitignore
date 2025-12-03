@@ -1,0 +1,25 @@
+# User configuration (contains TOTP secret)
+config.json
+
+# Generated files
+start_daemon.vbs
+.lock_state
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
