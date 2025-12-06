@@ -4,6 +4,7 @@ Program Lock GUI - File locking service with TOTP authentication
 A graphical interface for the Program Lock application.
 """
 
+import hashlib
 import json
 import os
 import socket
@@ -45,10 +46,14 @@ class Config:
                 self.files = data.get('files', [])
                 self.totp_secret = data.get('totp_secret')
                 self.armed = data.get('armed', False)
+                self.password_hash = data.get('password_hash')
+                self.password_failed = data.get('password_failed', False)
         else:
             self.files = []
             self.totp_secret = None
             self.armed = False
+            self.password_hash = None
+            self.password_failed = False
             self.save()
 
     def save(self):
@@ -56,8 +61,21 @@ class Config:
             json.dump({
                 'files': self.files,
                 'totp_secret': self.totp_secret,
-                'armed': self.armed
+                'armed': self.armed,
+                'password_hash': self.password_hash,
+                'password_failed': self.password_failed
             }, f, indent=4)
+
+    @staticmethod
+    def hash_password(password: str) -> str:
+        """Hash a password using SHA-256."""
+        return hashlib.sha256(password.encode('utf-8')).hexdigest()
+
+    def verify_password(self, password: str) -> bool:
+        """Verify a password against the stored hash."""
+        if not self.password_hash:
+            return True
+        return self.hash_password(password) == self.password_hash
 
     def add_file(self, filepath: str) -> bool:
         filepath = str(Path(filepath).resolve())
@@ -150,6 +168,219 @@ class TOTPDialog(tk.Toplevel):
 
     def on_ok(self):
         self.result = self.code_var.get().strip()
+        self.destroy()
+
+    def on_cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class PasswordDialog(tk.Toplevel):
+    """Dialog for entering password."""
+
+    def __init__(self, parent, title="Enter Password", show_confirm=False):
+        super().__init__(parent)
+        self.title(title)
+        self.result = None
+        self.show_confirm = show_confirm
+        self.transient(parent)
+        self.grab_set()
+
+        # Center on parent
+        height = 200 if show_confirm else 150
+        self.geometry(f"300x{height}")
+        self.resizable(False, False)
+
+        # Content
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="Enter password:").pack(anchor=tk.W)
+
+        self.password_var = tk.StringVar()
+        self.password_entry = ttk.Entry(frame, textvariable=self.password_var, show='*', font=('Consolas', 12), width=25)
+        self.password_entry.pack(pady=5)
+        self.password_entry.focus_set()
+
+        if show_confirm:
+            ttk.Label(frame, text="Confirm password:").pack(anchor=tk.W, pady=(10, 0))
+            self.confirm_var = tk.StringVar()
+            self.confirm_entry = ttk.Entry(frame, textvariable=self.confirm_var, show='*', font=('Consolas', 12), width=25)
+            self.confirm_entry.pack(pady=5)
+            self.confirm_entry.bind('<Return>', lambda e: self.on_ok())
+        else:
+            self.password_entry.bind('<Return>', lambda e: self.on_ok())
+
+        # Buttons
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(btn_frame, text="Cancel", command=self.on_cancel).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="OK", command=self.on_ok).pack(side=tk.RIGHT)
+
+        # Center window
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+
+        self.wait_window()
+
+    def on_ok(self):
+        password = self.password_var.get()
+        if not password:
+            messagebox.showerror("Error", "Password cannot be empty.", parent=self)
+            return
+        if self.show_confirm:
+            if password != self.confirm_var.get():
+                messagebox.showerror("Error", "Passwords do not match.", parent=self)
+                return
+        self.result = password
+        self.destroy()
+
+    def on_cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class DisarmDialog(tk.Toplevel):
+    """Dialog for disarming - handles password and optional TOTP."""
+
+    def __init__(self, parent, needs_password=True, needs_totp=False, title="Disarm"):
+        super().__init__(parent)
+        self.title(title)
+        self.password = None
+        self.totp_code = None
+        self.cancelled = True
+        self.transient(parent)
+        self.grab_set()
+
+        # Calculate height based on needs
+        height = 100
+        if needs_password:
+            height += 60
+        if needs_totp:
+            height += 60
+
+        self.geometry(f"300x{height}")
+        self.resizable(False, False)
+
+        # Content
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        self.password_var = tk.StringVar()
+        self.totp_var = tk.StringVar()
+
+        if needs_password:
+            ttk.Label(frame, text="Enter password:").pack(anchor=tk.W)
+            self.password_entry = ttk.Entry(frame, textvariable=self.password_var, show='*', font=('Consolas', 12), width=25)
+            self.password_entry.pack(pady=5)
+            self.password_entry.focus_set()
+
+        if needs_totp:
+            if needs_password:
+                ttk.Label(frame, text="TOTP required (previous failure):", foreground='#dc3545').pack(anchor=tk.W, pady=(10, 0))
+            else:
+                ttk.Label(frame, text="Enter TOTP code:").pack(anchor=tk.W)
+            self.totp_entry = ttk.Entry(frame, textvariable=self.totp_var, font=('Consolas', 14), width=10, justify='center')
+            self.totp_entry.pack(pady=5)
+            if not needs_password:
+                self.totp_entry.focus_set()
+
+        # Bind Enter key to last entry
+        if needs_totp:
+            self.totp_entry.bind('<Return>', lambda e: self.on_ok())
+        elif needs_password:
+            self.password_entry.bind('<Return>', lambda e: self.on_ok())
+
+        # Buttons
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(btn_frame, text="Cancel", command=self.on_cancel).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="Disarm", command=self.on_ok).pack(side=tk.RIGHT)
+
+        # Center window
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+
+        self.wait_window()
+
+    def on_ok(self):
+        self.password = self.password_var.get() if self.password_var.get() else None
+        self.totp_code = self.totp_var.get().strip() if self.totp_var.get() else None
+        self.cancelled = False
+        self.destroy()
+
+    def on_cancel(self):
+        self.cancelled = True
+        self.destroy()
+
+
+class PasswordResetDialog(tk.Toplevel):
+    """Dialog for resetting password with TOTP verification."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Reset Password")
+        self.result = None
+        self.new_password = None
+        self.transient(parent)
+        self.grab_set()
+
+        self.geometry("320x280")
+        self.resizable(False, False)
+
+        # Content
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="Enter TOTP code to reset password:").pack(anchor=tk.W)
+        self.totp_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.totp_var, font=('Consolas', 14), width=10, justify='center').pack(pady=5)
+
+        ttk.Separator(frame, orient='horizontal').pack(fill=tk.X, pady=10)
+
+        ttk.Label(frame, text="New password (leave empty to remove):").pack(anchor=tk.W)
+        self.password_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.password_var, show='*', font=('Consolas', 12), width=25).pack(pady=5)
+
+        ttk.Label(frame, text="Confirm new password:").pack(anchor=tk.W)
+        self.confirm_var = tk.StringVar()
+        confirm_entry = ttk.Entry(frame, textvariable=self.confirm_var, show='*', font=('Consolas', 12), width=25)
+        confirm_entry.pack(pady=5)
+        confirm_entry.bind('<Return>', lambda e: self.on_ok())
+
+        # Buttons
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(btn_frame, text="Cancel", command=self.on_cancel).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="Reset Password", command=self.on_ok).pack(side=tk.RIGHT)
+
+        # Center window
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+
+        self.wait_window()
+
+    def on_ok(self):
+        totp_code = self.totp_var.get().strip()
+        if not totp_code:
+            messagebox.showerror("Error", "TOTP code is required.", parent=self)
+            return
+
+        new_password = self.password_var.get()
+        confirm = self.confirm_var.get()
+
+        if new_password and new_password != confirm:
+            messagebox.showerror("Error", "Passwords do not match.", parent=self)
+            return
+
+        self.result = totp_code
+        self.new_password = new_password if new_password else None
         self.destroy()
 
     def on_cancel(self):
@@ -297,10 +528,15 @@ class ProgramLockGUI:
         self.totp_status = ttk.Label(status_grid, text="Checking...")
         self.totp_status.grid(row=2, column=1, sticky=tk.W, padx=5)
 
+        # Password status
+        ttk.Label(status_grid, text="Password:").grid(row=3, column=0, sticky=tk.W, padx=5)
+        self.password_status = ttk.Label(status_grid, text="Checking...")
+        self.password_status.grid(row=3, column=1, sticky=tk.W, padx=5)
+
         # Auto-start status
-        ttk.Label(status_grid, text="Auto-start:").grid(row=3, column=0, sticky=tk.W, padx=5)
+        ttk.Label(status_grid, text="Auto-start:").grid(row=4, column=0, sticky=tk.W, padx=5)
         self.autostart_status = ttk.Label(status_grid, text="Checking...")
-        self.autostart_status.grid(row=3, column=1, sticky=tk.W, padx=5)
+        self.autostart_status.grid(row=4, column=1, sticky=tk.W, padx=5)
 
         # Arm/Disarm buttons
         arm_frame = ttk.Frame(status_frame)
@@ -344,16 +580,18 @@ class ProgramLockGUI:
         settings_grid = ttk.Frame(settings_frame)
         settings_grid.pack(fill=tk.X)
 
-        # TOTP setup
+        # Authentication setup
         ttk.Button(settings_grid, text="Setup TOTP", command=self.setup_totp, width=15).grid(row=0, column=0, padx=5, pady=2)
+        ttk.Button(settings_grid, text="Setup Password", command=self.setup_password, width=15).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Button(settings_grid, text="Reset Password", command=self.reset_password, width=15).grid(row=0, column=2, padx=5, pady=2)
 
         # Daemon control
-        ttk.Button(settings_grid, text="Start Daemon", command=self.start_daemon, width=15).grid(row=0, column=1, padx=5, pady=2)
-        ttk.Button(settings_grid, text="Stop Daemon", command=self.stop_daemon, width=15).grid(row=0, column=2, padx=5, pady=2)
+        ttk.Button(settings_grid, text="Start Daemon", command=self.start_daemon, width=15).grid(row=1, column=0, padx=5, pady=2)
+        ttk.Button(settings_grid, text="Stop Daemon", command=self.stop_daemon, width=15).grid(row=1, column=1, padx=5, pady=2)
 
         # Startup control
-        ttk.Button(settings_grid, text="Install Auto-start", command=self.install_startup, width=15).grid(row=1, column=0, padx=5, pady=2)
-        ttk.Button(settings_grid, text="Remove Auto-start", command=self.uninstall_startup, width=15).grid(row=1, column=1, padx=5, pady=2)
+        ttk.Button(settings_grid, text="Install Auto-start", command=self.install_startup, width=15).grid(row=2, column=0, padx=5, pady=2)
+        ttk.Button(settings_grid, text="Remove Auto-start", command=self.uninstall_startup, width=15).grid(row=2, column=1, padx=5, pady=2)
 
     def refresh_status(self):
         """Refresh all status displays."""
@@ -386,6 +624,15 @@ class ProgramLockGUI:
             self.totp_status.config(text="Configured", style='Running.TLabel')
         else:
             self.totp_status.config(text="Not configured", style='Stopped.TLabel')
+
+        # Password status
+        if self.config.password_hash:
+            if self.config.password_failed:
+                self.password_status.config(text="Configured (TOTP required!)", style='Armed.TLabel')
+            else:
+                self.password_status.config(text="Configured", style='Running.TLabel')
+        else:
+            self.password_status.config(text="Not configured", style='Stopped.TLabel')
 
         # Auto-start status
         if self.check_autostart_installed():
@@ -428,18 +675,44 @@ class ProgramLockGUI:
 
     def disarm(self):
         """Disarm the lock."""
-        if not self.config.totp_secret:
-            # No TOTP configured, just disarm
-            response = DaemonClient.send_command({'action': 'disarm', 'totp_code': ''})
+        needs_password = bool(self.config.password_hash)
+        needs_totp = self.config.password_failed or (not needs_password and self.config.totp_secret)
+
+        if not needs_password and not needs_totp:
+            # No auth configured, just disarm
+            response = DaemonClient.send_command({'action': 'disarm', 'password': '', 'totp_code': ''})
         else:
-            dialog = TOTPDialog(self.root, "Enter TOTP Code to Disarm")
-            if dialog.result is None:
+            dialog = DisarmDialog(self.root, needs_password=needs_password, needs_totp=needs_totp)
+            if dialog.cancelled:
                 return
-            response = DaemonClient.send_command({'action': 'disarm', 'totp_code': dialog.result})
+            response = DaemonClient.send_command({
+                'action': 'disarm',
+                'password': dialog.password,
+                'totp_code': dialog.totp_code
+            })
 
         if response and response.get('success'):
             messagebox.showinfo("Disarmed", "Lock is now disarmed. Files are unlocked.")
             self.refresh_status()
+        elif response and response.get('needs_totp'):
+            # Password was wrong, now need TOTP
+            messagebox.showwarning("Password Failed", "Invalid password. TOTP is now required.")
+            self.refresh_status()
+            # Show dialog again with TOTP required
+            dialog = DisarmDialog(self.root, needs_password=True, needs_totp=True, title="Disarm (TOTP Required)")
+            if dialog.cancelled:
+                return
+            response = DaemonClient.send_command({
+                'action': 'disarm',
+                'password': dialog.password,
+                'totp_code': dialog.totp_code
+            })
+            if response and response.get('success'):
+                messagebox.showinfo("Disarmed", "Lock is now disarmed. Files are unlocked.")
+                self.refresh_status()
+            else:
+                error = response.get('error', 'Unknown error') if response else 'Daemon not responding'
+                messagebox.showerror("Error", f"Failed to disarm: {error}")
         else:
             error = response.get('error', 'Unknown error') if response else 'Daemon not responding'
             messagebox.showerror("Error", f"Failed to disarm: {error}")
@@ -518,6 +791,75 @@ class ProgramLockGUI:
             self.config.save()
             messagebox.showinfo("Success", "TOTP has been configured successfully!")
             self.refresh_status()
+
+    def setup_password(self):
+        """Set up password for disarm."""
+        if self.config.password_hash:
+            result = messagebox.askyesno("Password Already Configured",
+                "Password is already configured. Do you want to change it?")
+            if not result:
+                return
+
+        dialog = PasswordDialog(self.root, "Set Password", show_confirm=True)
+        if dialog.result is None:
+            return
+
+        # Try to set via daemon first, fall back to direct config update
+        response = DaemonClient.send_command({'action': 'set_password', 'password': dialog.result})
+        if response is None:
+            # Daemon not running, update config directly
+            self.config.password_hash = Config.hash_password(dialog.result)
+            self.config.password_failed = False
+            self.config.save()
+            messagebox.showinfo("Success", "Password has been set successfully!")
+        elif response.get('success'):
+            messagebox.showinfo("Success", "Password has been set successfully!")
+        else:
+            messagebox.showerror("Error", f"Failed to set password: {response.get('error', 'Unknown error')}")
+        self.refresh_status()
+
+    def reset_password(self):
+        """Reset password (requires TOTP)."""
+        if not self.config.totp_secret:
+            messagebox.showerror("TOTP Required",
+                "TOTP must be configured to reset password.\n\n"
+                "Tip: If you need to remove password without TOTP, manually edit config.json")
+            return
+
+        dialog = PasswordResetDialog(self.root)
+        if dialog.result is None:
+            return
+
+        response = DaemonClient.send_command({
+            'action': 'reset_password',
+            'totp_code': dialog.result,
+            'new_password': dialog.new_password
+        })
+
+        if response is None:
+            # Daemon not running, verify TOTP locally and update config
+            totp = pyotp.TOTP(self.config.totp_secret)
+            if not totp.verify(dialog.result, valid_window=1):
+                messagebox.showerror("Error", "Invalid TOTP code")
+                return
+            if dialog.new_password:
+                self.config.password_hash = Config.hash_password(dialog.new_password)
+            else:
+                self.config.password_hash = None
+            self.config.password_failed = False
+            self.config.save()
+            if dialog.new_password:
+                messagebox.showinfo("Success", "Password has been reset successfully!")
+            else:
+                messagebox.showinfo("Success", "Password has been removed!")
+        elif response.get('success'):
+            if dialog.new_password:
+                messagebox.showinfo("Success", "Password has been reset successfully!")
+            else:
+                messagebox.showinfo("Success", "Password has been removed!")
+        else:
+            messagebox.showerror("Error", f"Failed to reset password: {response.get('error', 'Unknown error')}")
+        self.refresh_status()
 
     def start_daemon(self):
         """Start the daemon process."""

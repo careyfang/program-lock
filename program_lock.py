@@ -5,6 +5,7 @@ Prevents specified files from being opened when armed.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -48,10 +49,14 @@ class Config:
                 self.files = data.get('files', [])
                 self.totp_secret = data.get('totp_secret')
                 self.armed = data.get('armed', False)
+                self.password_hash = data.get('password_hash')
+                self.password_failed = data.get('password_failed', False)
         else:
             self.files = []
             self.totp_secret = None
             self.armed = False
+            self.password_hash = None
+            self.password_failed = False
             self.save()
 
     def save(self):
@@ -59,8 +64,21 @@ class Config:
             json.dump({
                 'files': self.files,
                 'totp_secret': self.totp_secret,
-                'armed': self.armed
+                'armed': self.armed,
+                'password_hash': self.password_hash,
+                'password_failed': self.password_failed
             }, f, indent=4)
+
+    @staticmethod
+    def hash_password(password: str) -> str:
+        """Hash a password using SHA-256."""
+        return hashlib.sha256(password.encode('utf-8')).hexdigest()
+
+    def verify_password(self, password: str) -> bool:
+        """Verify a password against the stored hash."""
+        if not self.password_hash:
+            return True
+        return self.hash_password(password) == self.password_hash
 
     def add_file(self, filepath: str):
         filepath = str(Path(filepath).resolve())
@@ -303,11 +321,42 @@ class Daemon:
             if not self.config.armed:
                 return {'success': True, 'message': 'Already disarmed'}
 
-            # Verify TOTP
+            password = cmd.get('password')
             totp_code = cmd.get('totp_code')
-            if not self._verify_totp(totp_code):
-                return {'success': False, 'error': 'Invalid TOTP code'}
 
+            # If password is configured, verify it first
+            if self.config.password_hash:
+                if not password:
+                    # Tell client whether TOTP is also needed
+                    return {
+                        'success': False,
+                        'error': 'Password required',
+                        'needs_password': True,
+                        'needs_totp': self.config.password_failed
+                    }
+
+                if not self.config.verify_password(password):
+                    # Password wrong - set failed flag and require TOTP from now on
+                    self.config.password_failed = True
+                    self.config.save()
+                    return {
+                        'success': False,
+                        'error': 'Invalid password. TOTP now required.',
+                        'needs_totp': True
+                    }
+
+                # Password correct, but check if TOTP is required due to previous failure
+                if self.config.password_failed:
+                    if not self._verify_totp(totp_code):
+                        return {'success': False, 'error': 'TOTP required due to previous failed attempt'}
+
+            else:
+                # No password configured, fall back to TOTP only
+                if not self._verify_totp(totp_code):
+                    return {'success': False, 'error': 'Invalid TOTP code'}
+
+            # Success - reset failed flag and disarm
+            self.config.password_failed = False
             self.config.armed = False
             self.config.save()
             results = self.file_lock.unlock_all()
@@ -329,6 +378,39 @@ class Daemon:
                 # Re-lock any new files
                 self.file_lock.lock_all(self.config.files)
             return {'success': True, 'message': 'Config reloaded'}
+
+        elif action == 'set_password':
+            password = cmd.get('password')
+            if not password:
+                return {'success': False, 'error': 'Password required'}
+            self.config.password_hash = Config.hash_password(password)
+            self.config.password_failed = False
+            self.config.save()
+            return {'success': True, 'message': 'Password set successfully'}
+
+        elif action == 'reset_password':
+            # Require TOTP to reset password
+            totp_code = cmd.get('totp_code')
+            if not self._verify_totp(totp_code):
+                return {'success': False, 'error': 'Invalid TOTP code'}
+
+            new_password = cmd.get('new_password')
+            if new_password:
+                self.config.password_hash = Config.hash_password(new_password)
+            else:
+                self.config.password_hash = None
+            self.config.password_failed = False
+            self.config.save()
+            return {'success': True, 'message': 'Password reset successfully'}
+
+        elif action == 'get_auth_status':
+            # Return what authentication methods are configured
+            return {
+                'success': True,
+                'has_password': bool(self.config.password_hash),
+                'has_totp': bool(self.config.totp_secret),
+                'password_failed': self.config.password_failed
+            }
 
         return {'success': False, 'error': 'Unknown action'}
 
@@ -374,6 +456,87 @@ class CLI:
             return None
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+    def cmd_password(self):
+        """Set up password for disarm."""
+        if self.config.password_hash:
+            confirm = input("Password is already configured. Change it? (y/N): ")
+            if confirm.lower() != 'y':
+                print("Aborted.")
+                return
+
+        import getpass
+        password = getpass.getpass("Enter new password: ")
+        if not password:
+            print("Error: Password cannot be empty.")
+            return
+
+        confirm = getpass.getpass("Confirm password: ")
+        if password != confirm:
+            print("Error: Passwords do not match.")
+            return
+
+        # Try to set via daemon first, fall back to direct config update
+        response = self.send_command({'action': 'set_password', 'password': password})
+        if response is None:
+            # Daemon not running, update config directly
+            self.config.password_hash = Config.hash_password(password)
+            self.config.password_failed = False
+            self.config.save()
+            print("Password set successfully.")
+        elif response.get('success'):
+            print("Password set successfully.")
+        else:
+            print(f"Error: {response.get('error', 'Unknown error')}")
+
+    def cmd_reset_password(self):
+        """Reset password (requires TOTP)."""
+        if not self.config.totp_secret:
+            print("Error: TOTP must be configured to reset password.")
+            print("Tip: If you want to remove password without TOTP, manually edit config.json")
+            return
+
+        totp_code = input("Enter TOTP code: ").strip()
+
+        import getpass
+        print("\nEnter new password (or press Enter to remove password):")
+        new_password = getpass.getpass("New password: ")
+
+        if new_password:
+            confirm = getpass.getpass("Confirm password: ")
+            if new_password != confirm:
+                print("Error: Passwords do not match.")
+                return
+
+        response = self.send_command({
+            'action': 'reset_password',
+            'totp_code': totp_code,
+            'new_password': new_password if new_password else None
+        })
+
+        if response is None:
+            # Daemon not running, verify TOTP locally and update config
+            totp = pyotp.TOTP(self.config.totp_secret)
+            if not totp.verify(totp_code, valid_window=1):
+                print("Error: Invalid TOTP code")
+                return
+            if new_password:
+                self.config.password_hash = Config.hash_password(new_password)
+            else:
+                self.config.password_hash = None
+            self.config.password_failed = False
+            self.config.save()
+            if new_password:
+                print("Password reset successfully.")
+            else:
+                print("Password removed successfully.")
+        elif response.get('success'):
+            if new_password:
+                print("Password reset successfully.")
+            else:
+                print("Password removed successfully.")
+        else:
+            print(f"Error: {response.get('error', 'Unknown error')}")
 
     def cmd_setup(self):
         """Set up TOTP authentication."""
@@ -433,16 +596,54 @@ class CLI:
 
     def cmd_disarm(self, totp_code: str = None):
         """Disarm the lock."""
-        if not totp_code:
+        import getpass
+
+        password = None
+        totp_needed = False
+
+        # Check if password is configured
+        if self.config.password_hash:
+            password = getpass.getpass("Enter password: ")
+
+            # Check if TOTP is also needed (due to previous failure)
+            if self.config.password_failed:
+                totp_needed = True
+                print("TOTP also required due to previous failed attempt.")
+        else:
+            # No password, use TOTP only (legacy behavior)
+            totp_needed = True
+
+        if totp_needed and not totp_code:
             totp_code = input("Enter TOTP code: ").strip()
 
-        response = self.send_command({'action': 'disarm', 'totp_code': totp_code})
+        response = self.send_command({
+            'action': 'disarm',
+            'password': password,
+            'totp_code': totp_code
+        })
+
         if response is None:
             print("Error: Daemon is not running.")
             return
 
         if response.get('success'):
             print("Disarmed successfully.")
+        elif response.get('needs_totp'):
+            # Password was wrong, now need TOTP
+            print(f"Error: {response.get('error', 'Invalid password')}")
+            print("Please try again with TOTP.")
+            totp_code = input("Enter TOTP code: ").strip()
+            password = getpass.getpass("Enter password: ")
+
+            response = self.send_command({
+                'action': 'disarm',
+                'password': password,
+                'totp_code': totp_code
+            })
+            if response and response.get('success'):
+                print("Disarmed successfully.")
+            else:
+                print(f"Error: {response.get('error', 'Unknown error') if response else 'No response'}")
         else:
             print(f"Error: {response.get('error', 'Unknown error')}")
 
@@ -474,6 +675,9 @@ class CLI:
             print(f"  [{exists}] {f}")
 
         print(f"\nTOTP configured: {'Yes' if self.config.totp_secret else 'No'}")
+        print(f"Password configured: {'Yes' if self.config.password_hash else 'No'}")
+        if self.config.password_failed:
+            print("  WARNING: Password failed - TOTP required for disarm!")
 
         # Check startup installation
         cmd = ['schtasks', '/query', '/tn', TASK_NAME]
@@ -633,8 +837,10 @@ def main():
 Commands:
   daemon            Start the background daemon (keeps files locked)
   setup             Configure TOTP (Google Authenticator)
+  password          Set up password for disarm
+  reset-password    Reset password (requires TOTP)
   arm               Lock all configured files
-  disarm [code]     Unlock files (requires TOTP code)
+  disarm [code]     Unlock files (requires password, or TOTP if password failed)
   status            Show current lock status
   add <file>        Add a file to the lock list (permanent)
   remove <file>     Remove a file from the lock list
@@ -645,16 +851,18 @@ Commands:
 
 Example workflow:
   1. python program_lock.py setup          # Set up Google Authenticator
-  2. python program_lock.py add game.exe   # Add files to lock (permanent)
-  3. python program_lock.py install        # Auto-start on Windows boot
-  4. python program_lock.py daemon         # Start daemon now
-  5. python program_lock.py arm            # Arm the lock
-  6. python program_lock.py disarm 123456  # Disarm with TOTP code
+  2. python program_lock.py password       # Set up password for disarm
+  3. python program_lock.py add game.exe   # Add files to lock (permanent)
+  4. python program_lock.py install        # Auto-start on Windows boot
+  5. python program_lock.py daemon         # Start daemon now
+  6. python program_lock.py arm            # Arm the lock
+  7. python program_lock.py disarm         # Disarm with password
         """
     )
 
     parser.add_argument('command', nargs='?', default='status',
-                        choices=['daemon', 'setup', 'arm', 'disarm', 'status',
+                        choices=['daemon', 'setup', 'password', 'reset-password',
+                                'arm', 'disarm', 'status',
                                 'add', 'remove', 'list', 'shutdown',
                                 'install', 'uninstall'],
                         help='Command to execute')
@@ -669,6 +877,10 @@ Example workflow:
         daemon.start()
     elif args.command == 'setup':
         cli.cmd_setup()
+    elif args.command == 'password':
+        cli.cmd_password()
+    elif args.command == 'reset-password':
+        cli.cmd_reset_password()
     elif args.command == 'arm':
         cli.cmd_arm()
     elif args.command == 'disarm':
