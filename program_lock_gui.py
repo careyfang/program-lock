@@ -11,7 +11,6 @@ import socket
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 import tkinter as tk
@@ -594,22 +593,64 @@ class ProgramLockGUI:
         ttk.Button(settings_grid, text="Remove Auto-start", command=self.uninstall_startup, width=15).grid(row=2, column=1, padx=5, pady=2)
 
     def refresh_status(self):
-        """Refresh all status displays."""
-        self.config.load()
+        """Schedule status refresh in background thread."""
+        if hasattr(self, '_refresh_in_progress') and self._refresh_in_progress:
+            return  # Skip if refresh already running
+        self._refresh_in_progress = True
+        threading.Thread(target=self._fetch_status, daemon=True).start()
 
-        # Check daemon
-        if DaemonClient.is_running():
+    def _fetch_status(self):
+        """Fetch all status data in background thread."""
+        try:
+            # Reload config
+            self.config.load()
+
+            # Check daemon (blocking socket operations)
+            daemon_running = DaemonClient.is_running()
+            daemon_response = None
+            if daemon_running:
+                daemon_response = DaemonClient.send_command({'action': 'status'})
+
+            # Check autostart (blocking subprocess)
+            autostart_installed = self.check_autostart_installed()
+
+            # Check file existence (blocking I/O)
+            file_status = []
+            for filepath in self.config.files:
+                exists = os.path.exists(filepath)
+                file_status.append((filepath, exists))
+
+            # Schedule UI update on main thread
+            self.root.after(0, lambda: self._update_status_ui({
+                'daemon_running': daemon_running,
+                'daemon_response': daemon_response,
+                'autostart_installed': autostart_installed,
+                'file_status': file_status,
+                'config': {
+                    'armed': self.config.armed,
+                    'totp_secret': self.config.totp_secret,
+                    'password_hash': self.config.password_hash,
+                    'password_failed': self.config.password_failed,
+                }
+            }))
+        finally:
+            self._refresh_in_progress = False
+
+    def _update_status_ui(self, data):
+        """Update UI with fetched status data (runs on main thread)."""
+        # Update daemon status
+        if data['daemon_running']:
             self.daemon_status.config(text="Running", style='Running.TLabel')
-            response = DaemonClient.send_command({'action': 'status'})
+            response = data['daemon_response']
             if response and response.get('success'):
                 armed = response.get('armed', False)
             else:
-                armed = self.config.armed
+                armed = data['config']['armed']
         else:
             self.daemon_status.config(text="Not Running", style='Stopped.TLabel')
-            armed = self.config.armed
+            armed = data['config']['armed']
 
-        # Armed status
+        # Update armed status
         if armed:
             self.armed_status.config(text="ARMED (Locked)", style='Armed.TLabel')
             self.arm_btn.config(state=tk.DISABLED)
@@ -619,31 +660,30 @@ class ProgramLockGUI:
             self.arm_btn.config(state=tk.NORMAL)
             self.disarm_btn.config(state=tk.DISABLED)
 
-        # TOTP status
-        if self.config.totp_secret:
+        # Update TOTP status
+        if data['config']['totp_secret']:
             self.totp_status.config(text="Configured", style='Running.TLabel')
         else:
             self.totp_status.config(text="Not configured", style='Stopped.TLabel')
 
-        # Password status
-        if self.config.password_hash:
-            if self.config.password_failed:
+        # Update password status
+        if data['config']['password_hash']:
+            if data['config']['password_failed']:
                 self.password_status.config(text="Configured (TOTP required!)", style='Armed.TLabel')
             else:
                 self.password_status.config(text="Configured", style='Running.TLabel')
         else:
             self.password_status.config(text="Not configured", style='Stopped.TLabel')
 
-        # Auto-start status
-        if self.check_autostart_installed():
+        # Update autostart status
+        if data['autostart_installed']:
             self.autostart_status.config(text="Enabled", style='Running.TLabel')
         else:
             self.autostart_status.config(text="Disabled", style='Stopped.TLabel')
 
         # Update file list
         self.file_list.delete(0, tk.END)
-        for filepath in self.config.files:
-            exists = os.path.exists(filepath)
+        for filepath, exists in data['file_status']:
             status = "" if exists else " [NOT FOUND]"
             self.file_list.insert(tk.END, f"{filepath}{status}")
             if not exists:
@@ -660,11 +700,19 @@ class ProgramLockGUI:
             result = messagebox.askyesno("Daemon Not Running",
                 "The daemon is not running. Would you like to start it first?")
             if result:
-                self.start_daemon()
-                time.sleep(1)  # Give daemon time to start
-            else:
-                return
+                # Start daemon and arm after it's ready
+                self.start_daemon(callback=self._arm_after_daemon_start)
+            return
 
+        self._do_arm()
+
+    def _arm_after_daemon_start(self, daemon_started):
+        """Callback after daemon start attempt, continues with arm if successful."""
+        if daemon_started:
+            self._do_arm()
+
+    def _do_arm(self):
+        """Actually send the arm command."""
         response = DaemonClient.send_command({'action': 'arm'})
         if response and response.get('success'):
             messagebox.showinfo("Armed", "Lock is now armed. Files are locked.")
@@ -861,10 +909,17 @@ class ProgramLockGUI:
             messagebox.showerror("Error", f"Failed to reset password: {response.get('error', 'Unknown error')}")
         self.refresh_status()
 
-    def start_daemon(self):
-        """Start the daemon process."""
+    def start_daemon(self, callback=None):
+        """Start the daemon process.
+
+        Args:
+            callback: Optional callback function to call after daemon starts (or fails).
+                     Called with True if daemon started, False otherwise.
+        """
         if DaemonClient.is_running():
             messagebox.showinfo("Already Running", "The daemon is already running.")
+            if callback:
+                callback(True)
             return
 
         script_path = Path(__file__).parent / "program_lock.py"
@@ -887,13 +942,20 @@ class ProgramLockGUI:
                 stderr=subprocess.DEVNULL
             )
 
-        # Wait and check if it started
-        time.sleep(1)
-        if DaemonClient.is_running():
-            messagebox.showinfo("Started", "Daemon started successfully.")
-        else:
-            messagebox.showerror("Error", "Failed to start daemon.")
-        self.refresh_status()
+        # Check if daemon started after 1 second (non-blocking)
+        def check_daemon_started():
+            if DaemonClient.is_running():
+                messagebox.showinfo("Started", "Daemon started successfully.")
+                self.refresh_status()
+                if callback:
+                    callback(True)
+            else:
+                messagebox.showerror("Error", "Failed to start daemon.")
+                self.refresh_status()
+                if callback:
+                    callback(False)
+
+        self.root.after(1000, check_daemon_started)
 
     def stop_daemon(self):
         """Stop the daemon."""
@@ -921,7 +983,9 @@ class ProgramLockGUI:
         """Check if auto-start is installed."""
         try:
             cmd = ['schtasks', '/query', '/tn', TASK_NAME]
-            result = subprocess.run(cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    creationflags=subprocess.CREATE_NO_WINDOW,
+                                    timeout=3)
             return result.returncode == 0
         except:
             return False
