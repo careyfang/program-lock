@@ -589,8 +589,8 @@ class ProgramLockGUI:
         ttk.Button(settings_grid, text="Stop Daemon", command=self.stop_daemon, width=15).grid(row=1, column=1, padx=5, pady=2)
 
         # Startup control
-        ttk.Button(settings_grid, text="Install Auto-start", command=self.install_startup, width=15).grid(row=2, column=0, padx=5, pady=2)
-        ttk.Button(settings_grid, text="Remove Auto-start", command=self.uninstall_startup, width=15).grid(row=2, column=1, padx=5, pady=2)
+        ttk.Button(settings_grid, text="Install Auto-start", command=self.install_startup, width=18).grid(row=2, column=0, padx=5, pady=2)
+        ttk.Button(settings_grid, text="Remove Auto-start", command=self.uninstall_startup, width=18).grid(row=2, column=1, padx=5, pady=2)
 
     def refresh_status(self):
         """Schedule status refresh in background thread."""
